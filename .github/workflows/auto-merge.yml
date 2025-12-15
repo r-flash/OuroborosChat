@@ -1,0 +1,125 @@
+name: Auto-merge PRs into master
+
+on:
+  pull_request:
+    branches: [ master ]
+    types: [ opened, reopened, synchronize, ready_for_review ]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Attempt conditional merge (append-only to OuroborosChat.sh)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.warning('No pull_request payload found.');
+              return;
+            }
+            if (pr.base.ref !== 'master') {
+              core.info(`PR base is ${pr.base.ref}, not master. Skipping.`);
+              return;
+            }
+            if (pr.draft) {
+              core.info('PR is a draft. Skipping merge.');
+              return;
+            }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // 1) Ensure only one file changed and it is OuroborosChat.sh with no deletions
+            const filesResp = await github.rest.pulls.listFiles({ owner, repo, pull_number: pr.number, per_page: 100 });
+            const files = filesResp.data || [];
+            if (files.length !== 1) {
+              core.info(`Expected exactly 1 changed file, found ${files.length}. Skipping merge.`);
+              return;
+            }
+            const f = files[0];
+            if (f.filename !== 'OuroborosChat.sh') {
+              core.info(`Changed file is '${f.filename}', not 'OuroborosChat.sh'. Skipping merge.`);
+              return;
+            }
+            if (f.status !== 'modified') {
+              core.info(`File status is '${f.status}', expected 'modified'. Skipping merge.`);
+              return;
+            }
+            if ((f.deletions ?? 0) !== 0) {
+              core.info(`Detected ${f.deletions} deletions in OuroborosChat.sh. Not append-only. Skipping merge.`);
+              return;
+            }
+
+            // 2) Verify append-only by comparing base vs head content
+            const baseRef = pr.base.sha;
+            const headRef = pr.head.sha;
+            let baseContent;
+            try {
+              const baseFile = await github.rest.repos.getContent({ owner, repo, path: 'OuroborosChat.sh', ref: baseRef });
+              if (!Array.isArray(baseFile.data) && baseFile.data && baseFile.data.type === 'file') {
+                baseContent = Buffer.from(baseFile.data.content, baseFile.data.encoding || 'base64').toString('utf8');
+              } else {
+                core.info('Base OuroborosChat.sh is not a file or is missing. Skipping merge.');
+                return;
+              }
+            } catch (e) {
+              core.info(`Unable to read base OuroborosChat.sh at ${baseRef}: ${e.message}. Skipping merge.`);
+              return;
+            }
+
+            let headContent;
+            try {
+              const headFile = await github.rest.repos.getContent({ owner, repo, path: 'OuroborosChat.sh', ref: headRef });
+              if (!Array.isArray(headFile.data) && headFile.data && headFile.data.type === 'file') {
+                headContent = Buffer.from(headFile.data.content, headFile.data.encoding || 'base64').toString('utf8');
+              } else {
+                core.info('Head OuroborosChat.sh is not a file or is missing. Skipping merge.');
+                return;
+              }
+            } catch (e) {
+              core.info(`Unable to read head OuroborosChat.sh at ${headRef}: ${e.message}. Skipping merge.`);
+              return;
+            }
+
+            // Normalize contents by dropping everything from the marker line onwards
+            const MARKER = '# MESSAGES END HERE';
+            const hasMarker = (text) => {
+              if (typeof text !== 'string') return false;
+              const lines = text.split("\n");
+              return lines.some(l => l === MARKER);
+            };
+            const stripAfterMarker = (text) => {
+              if (typeof text !== 'string') return text;
+              const lines = text.split("\n");
+              const idx = lines.findIndex(l => l === MARKER);
+              return idx >= 0 ? lines.slice(0, idx).join('\n') : text;
+            };
+            // Skip merge if the marker is not present in either base or head
+            if (!hasMarker(baseContent) || !hasMarker(headContent)) {
+              core.info('Marker "# MESSAGES END HERE" not found in base or head OuroborosChat.sh. Skipping merge.');
+              return;
+            }
+            baseContent = stripAfterMarker(baseContent);
+            headContent = stripAfterMarker(headContent);
+
+            if (!headContent.startsWith(baseContent)) {
+              core.info('Head OuroborosChat.sh does not start with base content. Changes are not append-only. Skipping merge.');
+              return;
+            }
+            if (headContent.length === baseContent.length) {
+              core.info('No new content appended to OuroborosChat.sh. Skipping merge.');
+              return;
+            }
+
+            // Passed checks, attempt merge
+            try {
+              await github.rest.pulls.merge({ owner, repo, pull_number: pr.number, merge_method: 'merge' });
+              core.info(`Successfully merged PR #${pr.number} into master (append-only to OuroborosChat.sh).`);
+            } catch (error) {
+              core.warning(`Merge attempt failed for PR #${pr.number}: ${error.message}`);
+            }
