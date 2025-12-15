@@ -2,6 +2,7 @@
 set -euo pipefail
 
 echo "Welcome to OuroborosChat."
+echo 'Rmlyc3Qh' | base64 -d; echo
 # MESSAGES END HERE
 
 FILE="OuroborosChat.sh"
